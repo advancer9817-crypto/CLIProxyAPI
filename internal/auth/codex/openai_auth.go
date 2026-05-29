@@ -7,6 +7,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
+
+const codexHTTPRequestAttempts = 3
 
 // OAuth configuration constants for OpenAI Codex
 const (
@@ -32,6 +35,60 @@ const (
 // exchanging authorization codes for tokens, and refreshing access tokens.
 type CodexAuth struct {
 	httpClient *http.Client
+}
+
+func codexAuthRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := time.Duration(attempt+1) * 500 * time.Millisecond
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	return delay
+}
+
+func codexAuthSleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (o *CodexAuth) doRequestWithRetry(ctx context.Context, operation string, do func() (*http.Response, error)) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 0; attempt < codexHTTPRequestAttempts; attempt++ {
+		resp, err := do()
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || attempt+1 >= codexHTTPRequestAttempts {
+			return nil, err
+		}
+		if o.httpClient != nil {
+			o.httpClient.CloseIdleConnections()
+		}
+		delay := codexAuthRetryDelay(attempt)
+		log.Warnf("codex %s request failed on attempt %d/%d, retrying in %s: %v", operation, attempt+1, codexHTTPRequestAttempts, delay, err)
+		if errSleep := codexAuthSleepContext(ctx, delay); errSleep != nil {
+			return nil, errSleep
+		}
+	}
+	return nil, lastErr
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
@@ -109,15 +166,16 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		"code_verifier": {pkceCodes.CodeVerifier},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create token request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := o.httpClient.Do(req)
+	resp, err := o.doRequestWithRetry(ctx, "token exchange", func() (*http.Response, error) {
+		req, errRequest := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		req.Close = true
+		return o.httpClient.Do(req)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("token exchange request failed: %w", err)
 	}
@@ -195,15 +253,16 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		"scope":         {"openid profile email"},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create refresh request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := o.httpClient.Do(req)
+	resp, err := o.doRequestWithRetry(ctx, "token refresh", func() (*http.Response, error) {
+		req, errRequest := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		req.Close = true
+		return o.httpClient.Do(req)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("token refresh request failed: %w", err)
 	}

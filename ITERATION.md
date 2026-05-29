@@ -73,3 +73,21 @@ cpa disable  取消自启
 - `go build -o /home/advancer/project/CLIProxyAPI/cli-proxy-api ./cmd/server`: build pass。
 - 运行态验证：`cpa-proxy.service` 重启成功，PID 143678，`HTTP_PROXY`/`HTTPS_PROXY` 均为 `http://172.20.0.1:7890`。
 - POST 探测：`oauth2.googleapis.com/token` 5/5 次返回预期 `401` 且 0 EOF；`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` 5/5 次返回预期 `401` 且 0 EOF。
+
+## 2026-05-29: Codex responses EOF 传输重试
+
+### 变更摘要
+- Codex `/backend-api/codex/responses` 普通、compact、stream、图像非流式和图像流式入口统一增加传输错误重试。
+- Codex 请求重试时按 `request-retry` 和账号级 override 计算次数，每次重试都重新构造 request/body/header，避免复用已读请求体。
+- Codex OAuth token exchange 和 token refresh 增加最多 3 次传输错误重试，并在重试前关闭 idle 连接。
+
+### 修复
+- 修复 `Post "https://chatgpt.com/backend-api/codex/responses": EOF` 在连接建立或请求发送阶段失败后直接返回的问题。
+- 修复 Codex token 刷新遇到 EOF/socket close 时只能依赖外层循环、不能主动清理半关闭连接的问题。
+
+### 测试结果
+- `go test ./internal/runtime/executor ./internal/auth/codex`: 2/2 packages pass。
+- `go test ./...`: 104/104 packages pass，0 failures。
+- `go build -o /home/advancer/project/CLIProxyAPI/cli-proxy-api ./cmd/server`: build pass。
+- 运行态验证：`cpa-proxy.service` 重启成功，PID 241248，`HTTP_PROXY`/`HTTPS_PROXY` 均为 `http://172.20.0.1:7890`。
+- POST 探测：`chatgpt.com/backend-api/codex/responses` 5/5 次返回预期 `401` 且 0 EOF。

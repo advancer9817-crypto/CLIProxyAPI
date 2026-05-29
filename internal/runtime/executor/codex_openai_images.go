@@ -99,16 +99,23 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 	reporter.SetTranslatedReasoningEffort(body, "codex")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, req, body)
+	buildRequest := func() (*http.Request, error) {
+		httpReq, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, req, body)
+		if errCache != nil {
+			return nil, errCache
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		return httpReq, nil
+	}
+	httpReq, errCache := buildRequest()
 	if errCache != nil {
 		return resp, errCache
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := e.doCodexRequestWithRetry(ctx, auth, httpClient, "image responses", httpReq, buildRequest)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -189,16 +196,23 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 	reporter.SetTranslatedReasoningEffort(body, "codex")
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, req, body)
+	buildRequest := func() (*http.Request, error) {
+		httpReq, errCache := e.cacheHelper(ctx, sdktranslator.FromString(codexOpenAIImageSourceFormat), url, req, body)
+		if errCache != nil {
+			return nil, errCache
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		return httpReq, nil
+	}
+	httpReq, errCache := buildRequest()
 	if errCache != nil {
 		return nil, errCache
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	recordCodexOpenAIImageRequest(ctx, e.cfg, e.Identifier(), auth, url, httpReq.Header.Clone(), body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := e.doCodexRequestWithRetry(ctx, auth, httpClient, "image responses stream", httpReq, buildRequest)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +37,54 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+func codexRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
+	retry := 0
+	if cfg != nil {
+		retry = cfg.RequestRetry
+	}
+	if auth != nil {
+		if override, ok := auth.RequestRetryOverride(); ok {
+			retry = override
+		}
+	}
+	if retry < 0 {
+		retry = 0
+	}
+	attempts := retry + 1
+	if attempts < 1 {
+		return 1
+	}
+	return attempts
+}
+
+func codexTransportRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := time.Duration(attempt+1) * 500 * time.Millisecond
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	return delay
+}
+
+func codexWait(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -240,6 +289,43 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return httpClient.Do(httpReq)
 }
 
+func (e *CodexExecutor) doCodexRequestWithRetry(ctx context.Context, auth *cliproxyauth.Auth, httpClient *http.Client, operation string, firstReq *http.Request, build func() (*http.Request, error)) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if httpClient == nil {
+		httpClient = helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	}
+	attempts := codexRetryAttempts(auth, e.cfg)
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		httpReq := firstReq
+		var errReq error
+		if attempt > 0 || httpReq == nil {
+			httpReq, errReq = build()
+			if errReq != nil {
+				return nil, errReq
+			}
+		}
+		firstReq = nil
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo == nil {
+			return httpResp, nil
+		}
+		lastErr = errDo
+		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) || attempt+1 >= attempts {
+			return nil, errDo
+		}
+		httpClient.CloseIdleConnections()
+		delay := codexTransportRetryDelay(attempt)
+		log.Debugf("codex executor: transport error during %s, retrying in %s (attempt %d/%d): %v", operation, delay, attempt+1, attempts, errDo)
+		if errWait := codexWait(ctx, delay); errWait != nil {
+			return nil, errWait
+		}
+	}
+	return nil, lastErr
+}
+
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
@@ -288,11 +374,18 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	buildRequest := func() (*http.Request, error) {
+		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		return httpReq, nil
+	}
+	httpReq, err := buildRequest()
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -312,7 +405,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	})
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexRequestWithRetry(ctx, auth, httpClient, "responses", httpReq, buildRequest)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -446,11 +539,18 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	buildRequest := func() (*http.Request, error) {
+		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
+		return httpReq, nil
+	}
+	httpReq, err := buildRequest()
 	if err != nil {
 		return resp, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -470,7 +570,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	})
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexRequestWithRetry(ctx, auth, httpClient, "responses/compact", httpReq, buildRequest)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -549,11 +649,18 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
+	buildRequest := func() (*http.Request, error) {
+		httpReq, errBuild := e.cacheHelper(ctx, from, url, req, body)
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		return httpReq, nil
+	}
+	httpReq, err := buildRequest()
 	if err != nil {
 		return nil, err
 	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -574,7 +681,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.doCodexRequestWithRetry(ctx, auth, httpClient, "responses stream", httpReq, buildRequest)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
