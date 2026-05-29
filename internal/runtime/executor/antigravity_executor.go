@@ -559,12 +559,21 @@ attemptLoop:
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
 					return resp, errDo
 				}
+				antigravityCloseIdleConnections(httpClient)
 				lastStatus = 0
 				lastBody = nil
 				lastErr = errDo
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
+				}
+				if attempt+1 < attempts {
+					delay := antigravityTransportRetryDelay(attempt)
+					log.Debugf("antigravity executor: transport error for model %s, retrying in %s (attempt %d/%d): %v", baseModel, delay, attempt+1, attempts, errDo)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return resp, errWait
+					}
+					continue attemptLoop
 				}
 				err = errDo
 				return resp, err
@@ -759,12 +768,21 @@ attemptLoop:
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
 					return resp, errDo
 				}
+				antigravityCloseIdleConnections(httpClient)
 				lastStatus = 0
 				lastBody = nil
 				lastErr = errDo
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
+				}
+				if attempt+1 < attempts {
+					delay := antigravityTransportRetryDelay(attempt)
+					log.Debugf("antigravity executor: transport error for model %s, retrying in %s (attempt %d/%d): %v", baseModel, delay, attempt+1, attempts, errDo)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return resp, errWait
+					}
+					continue attemptLoop
 				}
 				err = errDo
 				return resp, err
@@ -1221,12 +1239,21 @@ attemptLoop:
 				if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
 					return nil, errDo
 				}
+				antigravityCloseIdleConnections(httpClient)
 				lastStatus = 0
 				lastBody = nil
 				lastErr = errDo
 				if idx+1 < len(baseURLs) {
 					log.Debugf("antigravity executor: request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
 					continue
+				}
+				if attempt+1 < attempts {
+					delay := antigravityTransportRetryDelay(attempt)
+					log.Debugf("antigravity executor: transport error for model %s, retrying in %s (attempt %d/%d): %v", baseModel, delay, attempt+1, attempts, errDo)
+					if errWait := antigravityWait(ctx, delay); errWait != nil {
+						return nil, errWait
+					}
+					continue attemptLoop
 				}
 				err = errDo
 				return nil, err
@@ -1724,19 +1751,34 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
-	if errReq != nil {
-		return auth, errReq
-	}
-	httpReq.Header.Set("Host", "oauth2.googleapis.com")
-	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// Real Antigravity uses Go's default User-Agent for OAuth token refresh
-	httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
-
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, errDo := httpClient.Do(httpReq)
-	if errDo != nil {
-		return auth, errDo
+	attempts := antigravityRetryAttempts(auth, e.cfg)
+	var httpResp *http.Response
+	var errDo error
+	for attempt := 0; attempt < attempts; attempt++ {
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(form.Encode()))
+		if errReq != nil {
+			return auth, errReq
+		}
+		httpReq.Header.Set("Host", "oauth2.googleapis.com")
+		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		// Real Antigravity uses Go's default User-Agent for OAuth token refresh
+		httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
+		httpReq.Close = true
+
+		httpResp, errDo = httpClient.Do(httpReq)
+		if errDo == nil {
+			break
+		}
+		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) || attempt+1 >= attempts {
+			return auth, errDo
+		}
+		antigravityCloseIdleConnections(httpClient)
+		delay := antigravityTransportRetryDelay(attempt)
+		log.Debugf("antigravity executor: token refresh transport error, retrying in %s (attempt %d/%d): %v", delay, attempt+1, attempts, errDo)
+		if errWait := antigravityWait(ctx, delay); errWait != nil {
+			return auth, errWait
+		}
 	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -2345,6 +2387,23 @@ func antigravityTransient429RetryDelay(attempt int) time.Duration {
 		delay = 500 * time.Millisecond
 	}
 	return delay
+}
+
+func antigravityTransportRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := time.Duration(attempt+1) * 500 * time.Millisecond
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	return delay
+}
+
+func antigravityCloseIdleConnections(client *http.Client) {
+	if client != nil {
+		client.CloseIdleConnections()
+	}
 }
 
 func antigravityInstantRetryDelay(wait time.Duration) time.Duration {

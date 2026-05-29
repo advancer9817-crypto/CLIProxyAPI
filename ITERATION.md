@@ -54,3 +54,22 @@ cpa disable  取消自启
 - `go test ./internal/misc ./internal/runtime/executor`: 2/2 packages pass；`internal/misc` 为 `[no test files]`；`internal/runtime/executor` 为 `ok`。
 - `go test ./...`: 104/104 packages pass；51 packages `ok`，53 packages `[no test files]`，0 failures。
 - 运行态验证：`cpa-proxy.service` 重启成功；重启后 `/v1/responses` 返回 `200`；`cloudcode-pa.googleapis.com` 通过 `172.20.0.1:7890` 代理返回预期根路径 `404`，确认 CONNECT/TLS 正常。
+
+## 2026-05-29: Antigravity EOF 剩余路径硬化
+
+### 变更摘要
+- Antigravity OAuth 授权码换 token、access token refresh、管理端 Antigravity token refresh、auth 文件导入 token refresh 均改为传输错误可重试。
+- Antigravity 主请求在连接建立或请求发送阶段遇到 EOF/socket close 时，先关闭 idle 连接，再按 `request-retry` 重建请求并重试。
+- 管理 API 工具文档同步为 `proxy-url` 为空时继承 `HTTP_PROXY`/`HTTPS_PROXY`，与运行逻辑一致。
+
+### 修复
+- 修复 `Post "https://oauth2.googleapis.com/token": EOF` 在 token 交换、token refresh、管理端 token 替换和 auth 文件刷新路径中单次失败直接返回的问题。
+- 修复 `Post "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF` 在 Antigravity 请求发出前或建连阶段失败时没有进入同一轮传输重试的问题。
+- 修复代理侧半关闭连接可能被继续复用的问题；每次可重试传输错误后显式关闭 idle 连接。
+
+### 测试结果
+- `go test ./internal/auth/antigravity ./internal/runtime/executor ./internal/api/handlers/management ./sdk/auth`: 4/4 packages pass。
+- `go test ./...`: 104/104 packages pass，0 failures。
+- `go build -o /home/advancer/project/CLIProxyAPI/cli-proxy-api ./cmd/server`: build pass。
+- 运行态验证：`cpa-proxy.service` 重启成功，PID 143678，`HTTP_PROXY`/`HTTPS_PROXY` 均为 `http://172.20.0.1:7890`。
+- POST 探测：`oauth2.googleapis.com/token` 5/5 次返回预期 `401` 且 0 EOF；`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse` 5/5 次返回预期 `401` 且 0 EOF。

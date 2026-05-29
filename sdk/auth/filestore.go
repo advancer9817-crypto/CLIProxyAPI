@@ -345,6 +345,8 @@ func extractAccessToken(metadata map[string]any) string {
 	return ""
 }
 
+const geminiAccessTokenRefreshAttempts = 3
+
 func refreshGeminiAccessToken(tokenMap map[string]any, httpClient *http.Client) (string, error) {
 	refreshToken, _ := tokenMap["refresh_token"].(string)
 	clientID, _ := tokenMap["client_id"].(string)
@@ -365,8 +367,30 @@ func refreshGeminiAccessToken(tokenMap map[string]any, httpClient *http.Client) 
 		"client_secret": {clientSecret},
 	}
 
-	resp, err := httpClient.PostForm(tokenURI, data)
-	if err != nil {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < geminiAccessTokenRefreshAttempts; attempt++ {
+		req, errReq := http.NewRequest(http.MethodPost, tokenURI, strings.NewReader(data.Encode()))
+		if errReq != nil {
+			return "", fmt.Errorf("refresh request: %w", errReq)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Close = true
+
+		resp, err = httpClient.Do(req)
+		if err == nil {
+			break
+		}
+		if attempt+1 >= geminiAccessTokenRefreshAttempts {
+			return "", fmt.Errorf("refresh request: %w", err)
+		}
+		httpClient.CloseIdleConnections()
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	if resp == nil {
 		return "", fmt.Errorf("refresh request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
