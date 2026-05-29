@@ -118,6 +118,48 @@ func defaultAntigravityTierID(loadResp map[string]any) string {
 	return "free-tier"
 }
 
+const antigravityHTTPRequestAttempts = 3
+
+func retryDelay(attempt int) time.Duration {
+	return time.Duration(attempt) * 500 * time.Millisecond
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (o *AntigravityAuth) doRequestWithRetry(ctx context.Context, operation string, do func() (*http.Response, error)) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 1; attempt <= antigravityHTTPRequestAttempts; attempt++ {
+		resp, err := do()
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if attempt == antigravityHTTPRequestAttempts {
+			break
+		}
+		log.Warnf("antigravity %s request failed on attempt %d/%d: %v", operation, attempt, antigravityHTTPRequestAttempts, err)
+		if errSleep := sleepContext(ctx, retryDelay(attempt)); errSleep != nil {
+			return nil, lastErr
+		}
+	}
+	return nil, lastErr
+}
+
 // BuildAuthURL generates the OAuth authorization URL.
 func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
 	if strings.TrimSpace(redirectURI) == "" {
@@ -184,6 +226,9 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 	if accessToken == "" {
 		return "", fmt.Errorf("antigravity userinfo: missing access token")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, UserInfoEndpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("antigravity userinfo: create request: %w", err)
@@ -191,7 +236,9 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("User-Agent", o.shortUserAgent())
 
-	resp, errDo := o.httpClient.Do(req)
+	resp, errDo := o.doRequestWithRetry(ctx, "userinfo", func() (*http.Response, error) {
+		return o.httpClient.Do(req.Clone(ctx))
+	})
 	if errDo != nil {
 		return "", fmt.Errorf("antigravity userinfo: execute request: %w", errDo)
 	}
@@ -225,6 +272,9 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 
 // FetchProjectID retrieves the project ID for the authenticated user via loadCodeAssist
 func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	userAgent := o.shortUserAgent()
 	loadReqBody := map[string]any{
 		"metadata": antigravityLoadCodeAssistMetadata(),
@@ -236,16 +286,17 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 	}
 
 	endpointURL := fmt.Sprintf("%s/%s:loadCodeAssist", APIEndpoint, APIVersion)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, strings.NewReader(string(rawBody)))
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, errDo := o.httpClient.Do(req)
+	resp, errDo := o.doRequestWithRetry(ctx, "loadCodeAssist", func() (*http.Response, error) {
+		req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, strings.NewReader(string(rawBody)))
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", userAgent)
+		return o.httpClient.Do(req)
+	})
 	if errDo != nil {
 		return "", fmt.Errorf("execute request: %w", errDo)
 	}
@@ -272,9 +323,10 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 	projectID := extractCloudaicompanionProject(loadResp)
 
 	if projectID == "" {
-		projectID, err = o.OnboardUser(ctx, accessToken, defaultAntigravityTierID(loadResp))
-		if err != nil {
-			return "", err
+		var errOnboard error
+		projectID, errOnboard = o.OnboardUser(ctx, accessToken, defaultAntigravityTierID(loadResp))
+		if errOnboard != nil {
+			return "", errOnboard
 		}
 		if projectID == "" {
 			return "", fmt.Errorf("project id not found in loadCodeAssist or onboardUser response")

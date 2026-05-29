@@ -5,6 +5,7 @@ cli-proxy-api
 # Configuration
 config.yaml
 .env
+.current_admin_key
 
 # Generated content
 bin/*

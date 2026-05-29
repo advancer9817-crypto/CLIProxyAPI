@@ -655,13 +655,14 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 		}
 	}
 
+	// When no proxy is explicitly configured, inherit environment proxy (HTTP_PROXY/HTTPS_PROXY).
+	// This matches config.yaml's documented behavior: empty proxy-url means inherit from environment.
+	// See also NewProxyAwareHTTPClient in proxy_helpers.go for the same convention used by model executors.
 	transport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok || transport == nil {
-		return &http.Transport{Proxy: nil}
+		return &http.Transport{}
 	}
-	clone := transport.Clone()
-	clone.Proxy = nil
-	return clone
+	return transport.Clone()
 }
 
 type apiKeyConfigEntry interface {
