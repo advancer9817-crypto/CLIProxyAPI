@@ -2,7 +2,9 @@ package management
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +22,10 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-const defaultAPICallTimeout = 60 * time.Second
+const (
+	defaultAPICallTimeout           = 60 * time.Second
+	antigravityOAuthRefreshAttempts = 3
+)
 
 const (
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -88,7 +93,7 @@ type apiCallResponse struct {
 // Proxy selection (highest priority first):
 //  1. Selected credential proxy_url
 //  2. Global config proxy-url
-//  3. Direct connect (environment proxies are not used)
+//  3. Environment proxy inherited from HTTP_PROXY/HTTPS_PROXY
 //
 // Response JSON (returned with HTTP 200 when the APICall itself succeeds):
 //   - status_code: Upstream HTTP status code.
@@ -248,6 +253,34 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 	return ""
 }
 
+func apiToolTransportRetryDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	delay := time.Duration(attempt+1) * 500 * time.Millisecond
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
+	}
+	return delay
+}
+
+func apiToolSleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) (string, error) {
 	if auth == nil {
 		return "", nil
@@ -369,19 +402,33 @@ func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
-	if errReq != nil {
-		return "", errReq
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
 	httpClient := &http.Client{
 		Timeout:   defaultAPICallTimeout,
 		Transport: h.apiCallTransport(auth),
 	}
-	resp, errDo := httpClient.Do(req)
-	if errDo != nil {
-		return "", errDo
+	var resp *http.Response
+	var errDo error
+	for attempt := 0; attempt < antigravityOAuthRefreshAttempts; attempt++ {
+		req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+		if errReq != nil {
+			return "", errReq
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Close = true
+
+		resp, errDo = httpClient.Do(req)
+		if errDo == nil {
+			break
+		}
+		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) || attempt+1 >= antigravityOAuthRefreshAttempts {
+			return "", errDo
+		}
+		httpClient.CloseIdleConnections()
+		delay := apiToolTransportRetryDelay(attempt)
+		log.Debugf("management antigravity oauth token refresh failed, retrying in %s (attempt %d/%d): %v", delay, attempt+1, antigravityOAuthRefreshAttempts, errDo)
+		if errWait := apiToolSleepContext(ctx, delay); errWait != nil {
+			return "", errWait
+		}
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -661,6 +708,14 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 	}
 	clone := transport.Clone()
 	clone.Proxy = nil
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{}
+	} else {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+	}
+	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return clone
 }
 
@@ -790,5 +845,15 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 		log.WithError(errBuild).Debug("build proxy transport failed")
 		return nil
 	}
-	return transport
+	// Force HTTP/1.1 to prevent proxy/upstream HTTP/2 stream errors (e.g. EOF errors on WSL NAT)
+	clone := transport.Clone()
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	if clone.TLSClientConfig == nil {
+		clone.TLSClientConfig = &tls.Config{}
+	} else {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+	}
+	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	return clone
 }

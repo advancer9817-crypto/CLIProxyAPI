@@ -4,6 +4,7 @@ package antigravity
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -118,6 +119,54 @@ func defaultAntigravityTierID(loadResp map[string]any) string {
 	return "free-tier"
 }
 
+const antigravityHTTPRequestAttempts = 3
+
+func retryDelay(attempt int) time.Duration {
+	return time.Duration(attempt) * 500 * time.Millisecond
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (o *AntigravityAuth) doRequestWithRetry(ctx context.Context, operation string, do func() (*http.Response, error)) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var lastErr error
+	for attempt := 1; attempt <= antigravityHTTPRequestAttempts; attempt++ {
+		resp, err := do()
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		if attempt == antigravityHTTPRequestAttempts {
+			break
+		}
+		if o.httpClient != nil {
+			o.httpClient.CloseIdleConnections()
+		}
+		log.Warnf("antigravity %s request failed on attempt %d/%d: %v", operation, attempt, antigravityHTTPRequestAttempts, err)
+		if errSleep := sleepContext(ctx, retryDelay(attempt)); errSleep != nil {
+			return nil, errSleep
+		}
+	}
+	return nil, lastErr
+}
+
 // BuildAuthURL generates the OAuth authorization URL.
 func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
 	if strings.TrimSpace(redirectURI) == "" {
@@ -143,13 +192,18 @@ func (o *AntigravityAuth) ExchangeCodeForTokens(ctx context.Context, code, redir
 	data.Set("redirect_uri", redirectURI)
 	data.Set("grant_type", "authorization_code")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenEndpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("antigravity token exchange: create request: %w", err)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, errDo := o.httpClient.Do(req)
+	resp, errDo := o.doRequestWithRetry(ctx, "token exchange", func() (*http.Response, error) {
+		req, errRequest := http.NewRequestWithContext(ctx, http.MethodPost, TokenEndpoint, strings.NewReader(data.Encode()))
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Close = true
+		return o.httpClient.Do(req)
+	})
 	if errDo != nil {
 		return nil, fmt.Errorf("antigravity token exchange: execute request: %w", errDo)
 	}
