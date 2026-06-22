@@ -268,11 +268,14 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					}
 					return
 				}
-				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				flusher.Flush()
-				cliCancel(nil)
+				// Stream closed without any data — upstream returned an empty stream.
+				// Return a 502 so the client can retry rather than seeing
+				// "Stream ended without receiving any events".
+				h.WriteErrorResponse(c, &interfaces.ErrorMessage{
+					StatusCode: http.StatusBadGateway,
+					Error:      fmt.Errorf("upstream returned empty stream"),
+				})
+				cliCancel(fmt.Errorf("upstream returned empty stream"))
 				return
 			}
 

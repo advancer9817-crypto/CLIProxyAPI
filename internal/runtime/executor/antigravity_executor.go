@@ -2488,7 +2488,17 @@ func antigravityShouldRetryNoCapacity(statusCode int, body []byte) bool {
 		return false
 	}
 	msg := strings.ToLower(string(body))
-	return strings.Contains(msg, "no capacity available")
+	if strings.Contains(msg, "no capacity available") {
+		return true
+	}
+	// Google Cloud Code returns MODEL_CAPACITY_EXHAUSTED as a JSON error reason
+	reason := gjson.GetBytes(body, "error.details.#.reason").Array()
+	for _, r := range reason {
+		if strings.EqualFold(r.String(), "MODEL_CAPACITY_EXHAUSTED") {
+			return true
+		}
+	}
+	return false
 }
 
 func antigravityShouldRetryTransientResourceExhausted429(statusCode int, body []byte) bool {
