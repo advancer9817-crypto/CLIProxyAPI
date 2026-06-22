@@ -38,6 +38,36 @@ cpa disable  取消自启
 2. 停止并禁用 systemd services: `systemctl --user disable cpa-proxy cpa-manager-plus`
 3. 删除 `/home/advancer/.config/systemd/user/cpa-proxy.service` 和 `cpa-manager-plus.service`
 
+## 2026-06-22: Antigravity EOF 传输层重试与容错修复
+
+### 问题
+CProxyProxy 管理面板中大量 Antigravity 账号报 `Post "cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF` 错误。
+
+### 根因
+Google Cloud Code 服务端在高负载或内部调度时主动断开 TCP 连接，WSL2 NAT 环境加剧了此问题。原有的重试逻辑只处理 HTTP 层面的 429/503 状态码，不对传输层错误（EOF/reset/broken pipe）做同 URL 重试。
+
+### 解决思路
+1. **传输层重试**：在 `httpClient.Do()` 返回错误后关闭空闲连接、切换 fallback base URL，若无可用端点则同 URL 带退避重试（500ms→2s cap）
+2. **Token 刷新硬化**：OAuth 刷新改为带重试的循环，`httpReq.Close = true` 禁止连接复用
+3. **MODEL_CAPACITY_EXHAUSTED 检测**：从 Google Cloud Code JSON 响应的 `error.details.#.reason` 中检测容量耗尽
+4. **空流 502**：上游返回空 SSE 流时返回 502 Bad Gateway 给客户端，使其可重试
+5. **HTTP/1.1 强制**：管理 API 和 OAuth 客户端禁用 HTTP/2，避免 WSL NAT 下的帧复用超时
+
+### 文件变更
+| 文件 | 变更 |
+|------|------|
+| `internal/runtime/executor/antigravity_executor.go` | 3 处传输重试 + token 刷新硬化 + MODEL_CAPACITY_EXHAUSTED + `antigravityTransportRetryDelay` / `antigravityCloseIdleConnections` |
+| `internal/api/handlers/management/api_tools.go` | HTTP/1.1 强制 |
+| `internal/auth/antigravity/auth.go` | HTTP/1.1 + WSL NAT 兼容 |
+| `sdk/auth/filestore.go` | HTTP/1.1 适配 |
+| `sdk/api/handlers/claude/code_handlers.go` | 空流 502 |
+
+### 详细文档
+见 `docs/antigravity-eof-retry.md`
+
+### CPA-Manager-Plus 前端同步
+合并 upstream v1.4.2→v1.8.0（269 文件），新增 Usage Analytics、插件商店、配额冷却自动化、Codex reauth、账户处理策略、ECharts、增强监控、国际化更新、Antigravity 订阅管理。
+
 ## 2026-05-29: Antigravity 代理稳定性修复与官方更新准备
 
 ### 变更摘要
